@@ -1,0 +1,102 @@
+name: Publish signed PC release feed
+on:
+  workflow_dispatch:
+    inputs:
+      current_version:
+        description: Already published signed stable release version
+        required: true
+        type: string
+      previous_version:
+        description: Already published signed rollback baseline version
+        required: true
+        type: string
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: signed-pc-pages
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download only existing public release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_VERSION: ${{ inputs.current_version }}
+          PREVIOUS_VERSION: ${{ inputs.previous_version }}
+        run: |
+          set -euo pipefail
+          for version in "$CURRENT_VERSION" "$PREVIOUS_VERSION"; do
+            [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || exit 1
+            gh release view "v$version" --repo E-Mufeng/role-tavern-releases --json isDraft,isPrerelease \
+              --jq 'if (.isDraft or .isPrerelease) then error("Not a published stable release") else true end'
+            mkdir -p "download/$version"
+            gh release download "v$version" --repo E-Mufeng/role-tavern-releases --dir "download/$version" \
+              --pattern "RoleTavern-$version-win-x64.exe" --pattern release.json --pattern latest.yml
+          done
+      - name: Verify the existing fixed Ed25519 trust and exact installer bytes
+        shell: bash
+        env:
+          CURRENT_VERSION: ${{ inputs.current_version }}
+          PREVIOUS_VERSION: ${{ inputs.previous_version }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'JS'
+          import fs from 'node:fs/promises';
+          import { createReadStream } from 'node:fs';
+          import { createHash, verify } from 'node:crypto';
+          const need = (condition, message) => { if (!condition) throw Error(message); };
+          const current = process.env.CURRENT_VERSION, previous = process.env.PREVIOUS_VERSION;
+          const a = current.split('.').map(BigInt), b = previous.split('.').map(BigInt);
+          const different = a.findIndex((value, index) => value !== b[index]);
+          need(different >= 0 && a[different] > b[different], 'Current version must be newer than rollback baseline');
+          const key = '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAPrg20mLa8G4dMbHzqcbfD3etqyd3GRbfhv1UC6nkRNg=\n-----END PUBLIC KEY-----\n';
+          let total = 0;
+          for (const version of [current, previous]) {
+            const root = `download/${version}`, envelopeFile = `${root}/release.json`;
+            need((await fs.stat(envelopeFile)).size <= 65536, 'Oversized release metadata');
+            const envelope = JSON.parse(await fs.readFile(envelopeFile, 'utf8'));
+            need(envelope.format === 'role-tavern-signed-release-v1', 'Wrong envelope format');
+            const payload = Buffer.from(envelope.payload, 'base64'), signature = Buffer.from(envelope.signature, 'base64');
+            need(payload.length <= 16384 && signature.length === 64 && verify(null, payload, key, signature), 'Release signature mismatch');
+            const release = JSON.parse(payload);
+            need(release.format === 'role-tavern-release-v1' && release.appId === 'local.role-tavern.pc' &&
+              release.platform === 'win32' && release.arch === 'x64' && release.channel === 'stable' && release.version === version, 'Wrong signed release identity');
+            const file = `RoleTavern-${version}-win-x64.exe`;
+            need(release.installer.file === file && Number.isSafeInteger(release.installer.bytes) &&
+              release.installer.bytes > 0 && release.installer.bytes <= 1073741824, 'Wrong installer contract');
+            const installer = `${root}/${file}`, stat = await fs.lstat(installer);
+            need(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && stat.size === release.installer.bytes, 'Wrong downloaded installer length');
+            const hash = createHash('sha512');
+            for await (const chunk of createReadStream(installer)) hash.update(chunk);
+            need(hash.digest('base64') === release.installer.sha512, 'Wrong downloaded installer digest');
+            const latestFile = `${root}/latest.yml`;
+            need((await fs.stat(latestFile)).size <= 65536, 'Oversized SDK metadata');
+            const latest = JSON.parse(await fs.readFile(latestFile, 'utf8'));
+            need(latest.version === version && latest.path === file && latest.sha512 === release.installer.sha512 &&
+              latest.files?.length === 1 && latest.files[0].url === file && latest.files[0].sha512 === release.installer.sha512 &&
+              latest.files[0].size === stat.size, 'SDK metadata differs from signed release');
+            const destination = version === current ? '_site' : `_site/versions/${version}`;
+            await fs.mkdir(destination, { recursive: true });
+            for (const name of [file, 'release.json', 'latest.yml']) {
+              total += (await fs.stat(`${root}/${name}`)).size;
+              need(total < 1000000000, 'Feed exceeds the documented Pages site limit');
+              await fs.copyFile(`${root}/${name}`, `${destination}/${name}`, fs.constants.COPYFILE_EXCL);
+            }
+          }
+          await fs.writeFile('_site/index.html', '<!doctype html><meta charset="utf-8"><title>Role Tavern PC releases</title><h1>Role Tavern PC signed releases</h1><p>Installers and accompanying third-party distribution materials: <a href="https://github.com/E-Mufeng/role-tavern-releases/releases">release downloads</a>.</p>');
+          JS
+      - name: Upload verified static files
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: _site
+      - name: Deploy the verified feed
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
