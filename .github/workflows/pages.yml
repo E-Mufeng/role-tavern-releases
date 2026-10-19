@@ -90,6 +90,12 @@ jobs:
               need(total < 1000000000, 'Feed exceeds the documented Pages site limit');
               await fs.copyFile(`${root}/${name}`, `${destination}/${name}`, fs.constants.COPYFILE_EXCL);
             }
+            // Installed clients explicitly select the signed "stable" channel.
+            // GenericProvider therefore requests stable.yml, not latest.yml.
+            // Publish its exact verified metadata; no alternate/unverified feed.
+            total += (await fs.stat(latestFile)).size;
+            need(total < 1000000000, 'Feed exceeds the documented Pages site limit');
+            await fs.copyFile(latestFile, `${destination}/stable.yml`, fs.constants.COPYFILE_EXCL);
           }
           await fs.writeFile('_site/index.html', '<!doctype html><meta charset="utf-8"><title>Role Tavern PC releases</title><h1>Role Tavern PC signed releases</h1><p>Installers and accompanying third-party distribution materials: <a href="https://github.com/E-Mufeng/role-tavern-releases/releases">release downloads</a>.</p>');
           JS
